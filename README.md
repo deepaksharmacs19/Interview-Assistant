@@ -1,4 +1,4 @@
-# Interview Assistant — Top Overlay Edition (Windows 11)
+# Interview Assistant - Top Overlay Edition
 
 A compact, always-on-top, top-center Gemini interview **practice** assistant with screenshot analysis, optional microphone input, typed questions, and streaming answers.
 
