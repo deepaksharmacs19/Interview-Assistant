@@ -17,16 +17,19 @@ from google.genai import types
 from pynput import keyboard
 import sounddevice as sd
 
-DEFAULT_MODEL = 'gemini-3.8-flash'
-FALLBACK_MODEL = 'gemini-3.6-flash'
-PROMPT = ('You are an interview practice tutor. Answer the question immediately in 2-5 short sentences. '
-          'For code questions give minimal correct code if needed. For personal experience questions, '
-          'give a sample structure rather than fabricating details. Be accurate and concise.')
+DEFAULT_MODEL = 'gemini-3.5-flash-lite'
+FALLBACK_MODEL = 'gemini-3.1-flash-lite'
+MODEL_CHOICES = (DEFAULT_MODEL, FALLBACK_MODEL, 'gemini-3.5-flash',
+                 'gemini-3.6-flash', 'gemini-3.8-flash')
+PROMPT = ('You are a concise interview practice tutor. Answer the question directly in at most '
+          '3 short sentences. No introductions or filler. For code questions give only minimal '
+          'correct code and a brief explanation if needed. For experience questions give a '
+          'sample structure and never invent personal achievements.')
 
 class InterviewAssistant:
     def __init__(self, root):
         self.root = root
-        root.title('Interview Assistant • Practice')
+        root.title('Interview Assistant')
         screen_width = root.winfo_screenwidth()
         width = min(780, max(480, screen_width - 60))
         root.geometry(f'{width}x310+{max(0, (screen_width-width)//2)}+12')
@@ -36,6 +39,8 @@ class InterviewAssistant:
         self.working = False
         self.recording = False
         self.started_at = None
+        self.first_token_at = None
+        self.stream_started = False
         self.hotkeys = None
         self.api_key = tk.StringVar(value=os.getenv('GEMINI_API_KEY', ''))
         self.model = tk.StringVar(value=DEFAULT_MODEL)
@@ -112,8 +117,9 @@ class InterviewAssistant:
         self.key_entry = ttk.Entry(body, textvariable=self.api_key, show='•')
         self.key_entry.pack(fill='x', pady=(3, 8))
         ttk.Label(body, text='Model').pack(anchor='w')
-        ttk.Entry(body, textvariable=self.model).pack(fill='x', pady=(3, 8))
-        ttk.Checkbutton(body, text='Fallback to Gemini 3.6 Flash on 503', variable=self.allow_fallback).pack(anchor='w')
+        ttk.Combobox(body, textvariable=self.model, values=MODEL_CHOICES).pack(fill='x', pady=(3, 8))
+        ttk.Checkbutton(body, text='Try another Flash-Lite model on 503 (brief fallback)',
+                        variable=self.allow_fallback).pack(anchor='w')
         audio = ttk.Frame(body)
         audio.pack(fill='x', pady=(5, 2))
         ttk.Label(audio, text='Microphone recording duration (seconds)').pack(side='left')
@@ -174,6 +180,10 @@ class InterviewAssistant:
                 elif kind == 'record':
                     self.record_audio()
                 elif kind == 'chunk':
+                    if not self.stream_started:
+                        self.stream_started = True
+                        self.first_token_at = time.monotonic()
+                        self.status.set(f'First answer text in {self.first_token_at-self.started_at:.1f}s • streaming...')
                     self.answer.configure(state='normal')
                     self.answer.insert('end', payload)
                     self.answer.see('end')
@@ -183,7 +193,9 @@ class InterviewAssistant:
                     if payload:
                         self.set_answer(payload)
                     elapsed = time.monotonic() - self.started_at if self.started_at else 0
-                    self.status.set(f'Ready. Gemini response in {elapsed:.1f}s (including capture or recording).')
+                    first = (f' • first text {self.first_token_at-self.started_at:.1f}s'
+                             if self.first_token_at and self.started_at else '')
+                    self.status.set(f'Ready • total {elapsed:.1f}s{first} (includes recording/capture).')
                 elif kind == 'error':
                     self.working = False
                     self.set_answer('Error: ' + str(payload))
@@ -214,35 +226,38 @@ class InterviewAssistant:
             return None
         self.working = True
         self.started_at = time.monotonic()
+        self.first_token_at = None
+        self.stream_started = False
         self.set_answer('')
         return key, model, self.allow_fallback.get()
 
     def call_gemini(self, key, model, contents, allow_fallback=True):
-        """Stream Gemini output; fall back only for server overload before text starts."""
+        """Low-latency streaming; one primary attempt, then a brief overload fallback."""
+        client = None
         try:
-            # Limit the SDK to two total requests per model, preventing long retry waits.
+            # Disable automatic multi-second retries. Let the fallback handle 503.
             client = genai.Client(
                 api_key=key,
                 http_options=types.HttpOptions(
-                    retry_options=types.HttpRetryOptions(
-                        attempts=2, initial_delay=0.6, max_delay=1.5,
-                        http_status_codes=[503],
-                    ),
-                    timeout=25000,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                    timeout=16000,
                 ),
             )
-            models = [model]
-            if allow_fallback and model == DEFAULT_MODEL:
-                models.append(FALLBACK_MODEL)
+            candidates = [model]
+            if allow_fallback:
+                backup = (FALLBACK_MODEL if model != FALLBACK_MODEL else DEFAULT_MODEL)
+                if backup not in candidates:
+                    candidates.append(backup)
 
-            for i, candidate in enumerate(models):
+            for index, candidate in enumerate(candidates):
                 saw_text = False
                 try:
-                    self.events.put(('status', f'Asking {candidate}...'))
-                    cfg = {'max_output_tokens': 450}
-                    if candidate.startswith(('gemini-3.8-flash', 'gemini-3.6-flash')):
-                        cfg['thinking_config'] = types.ThinkingConfig(thinking_level='low')
-                    config = types.GenerateContentConfig(**cfg)
+                    self.events.put(('status', f'Asking {candidate} • streaming...'))
+                    level = 'low' if candidate.startswith(('gemini-3.8-', 'gemini-3.7-')) else 'minimal'
+                    config = types.GenerateContentConfig(
+                        max_output_tokens=240,
+                        thinking_config=types.ThinkingConfig(thinking_level=level),
+                    )
                     for response in client.models.generate_content_stream(
                             model=candidate, contents=contents, config=config):
                         chunk = response.text or ''
@@ -252,21 +267,25 @@ class InterviewAssistant:
                     self.events.put(('result', '' if saw_text else 'No text returned by Gemini.'))
                     return
                 except Exception as exc:
-                    # Don't switch models after streaming has begun: it could duplicate answers.
                     code = getattr(exc, 'code', None)
-                    overloaded = code == 503 or ('503' in str(exc) and 'UNAVAILABLE' in str(exc))
-                    if overloaded and not saw_text and i + 1 < len(models):
-                        self.events.put(('status', f'{candidate} overloaded (503); trying {models[i+1]}...'))
+                    message = str(exc)
+                    overloaded = code == 503 or ('503' in message and 'UNAVAILABLE' in message)
+                    if overloaded and not saw_text and index + 1 < len(candidates):
+                        self.events.put(('status', f'{candidate} busy • trying {candidates[index + 1]}...'))
                         continue
                     if overloaded:
-                        self.events.put(('error', 'Google Gemini is currently overloaded (503). '
-                                         'Both requested model and any enabled backup were unavailable. '
-                                         'Please retry shortly or choose another available model.'))
+                        self.events.put(('error', 'Google is busy (503). Try again, or select another model in Settings.'))
                     else:
-                        self.events.put(('error', str(exc)))
+                        self.events.put(('error', message))
                     return
         except Exception as exc:
             self.events.put(('error', str(exc)))
+        finally:
+            try:
+                if client is not None:
+                    client.close()
+            except Exception:
+                pass
 
     def analyze_screen(self):
         settings = self.client_settings()
@@ -276,7 +295,7 @@ class InterviewAssistant:
         self.status.set('Capturing primary screen...')
         # Hide the overlay during local screenshot analysis regardless of capture affinity.
         self.root.withdraw()
-        self.root.after(150, lambda: self.finish_capture(key, model, fallback))
+        self.root.after(80, lambda: self.finish_capture(key, model, fallback))
 
     def finish_capture(self, key, model, fallback):
         try:
@@ -285,14 +304,14 @@ class InterviewAssistant:
                 grab = sct.grab(monitor)
                 image = Image.frombytes('RGB', grab.size, grab.rgb)
             # JPEG and resizing substantially reduce upload bytes and encoding work.
-            image.thumbnail((1600, 1000), Image.Resampling.LANCZOS)
+            image.thumbnail((1280, 800), Image.Resampling.BILINEAR)
             buffer = io.BytesIO()
-            image.save(buffer, format='JPEG', quality=72, optimize=False)
+            image.save(buffer, format='JPEG', quality=65, optimize=False)
             data = buffer.getvalue()
             self.root.deiconify()
             self.root.lift()
             self.root.after(150, self.apply_capture_exclusion)
-            self.status.set('Analyzing screenshot with Gemini...')
+            self.status.set('Analyzing compressed screenshot...')
             contents = [PROMPT + '\nRead any visible interview practice question in this screenshot. If none is visible, say so.',
                         types.Part.from_bytes(data=data, mime_type='image/jpeg')]
             threading.Thread(target=self.call_gemini, args=(key, model, contents, fallback), daemon=True).start()
